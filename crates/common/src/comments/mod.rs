@@ -94,7 +94,7 @@ impl Comments {
 
             // Stop when we find a trailing or a non-mixed comment
             match cmnt.style {
-                CommentStyle::Mixed => continue,
+                CommentStyle::Mixed => {}
                 CommentStyle::Trailing => return Some((cmnt, i)),
                 _ => break,
             }
@@ -195,6 +195,7 @@ impl<'ast> CommentGatherer<'ast> {
             self.disabled_block_depth -= 1;
         }
 
+        #[allow(clippy::collapsible_match)]
         match token.kind {
             TokenKind::Whitespace => {
                 if let Some(mut idx) = token_text.find('\n') {
@@ -229,11 +230,13 @@ impl<'ast> CommentGatherer<'ast> {
                 };
                 let kind = CommentKind::Block;
 
-                // Count the number of chars since the start of the line by rescanning.
+                // Measure the opening column, expanding tabs for non-doc comments.
                 let pos_in_file = self.start_bpos + BytePos(self.pos as u32);
                 let line_begin_in_file = line_begin_pos(self.sf, pos_in_file);
                 let line_begin_pos = (line_begin_in_file - self.start_bpos).to_usize();
-                let mut col = CharPos(self.text[line_begin_pos..self.pos].chars().count());
+                let tab_width = if is_doc { 1 } else { self.tab_width.unwrap_or(1) };
+                let mut col =
+                    CharPos(estimate_line_width(&self.text[line_begin_pos..self.pos], tab_width));
 
                 // To preserve alignment in multi-line non-doc comments, normalize the block based
                 // on its least-indented line.
@@ -243,7 +246,10 @@ impl<'ast> CommentGatherer<'ast> {
                             return min;
                         }
                         std::cmp::min(
-                            CharPos(line.chars().count() - line.trim_start().chars().count()),
+                            CharPos(estimate_line_width(
+                                &line[..line.len() - line.trim_start().len()],
+                                tab_width,
+                            )),
                             min,
                         )
                     })
@@ -311,14 +317,28 @@ impl<'ast> CommentGatherer<'ast> {
         }
 
         for (pos, line) in lines.delimited() {
+            let indent_end = line.len() - line.trim_start().len();
+            let mut expanded = String::new();
+            let line = if !is_doc
+                && let Some(tab_width) = self.tab_width
+                && line[..indent_end].contains('\t')
+            {
+                // Trim tab indentation in the same display columns used by the printer.
+                expanded.extend(std::iter::repeat_n(
+                    ' ',
+                    estimate_line_width(&line[..indent_end], tab_width),
+                ));
+                expanded.push_str(&line[indent_end..]);
+                expanded.as_str()
+            } else {
+                line
+            };
             let line = normalize_block_comment_ws(line, col).trim_end().to_string();
             if !is_doc {
                 res.push(line);
                 continue;
             }
-            if !pos.is_last {
-                res.push(format_doc_block_comment(&line, self.tab_width));
-            } else {
+            if pos.is_last {
                 // Ensure last line of a doc comment only has the `*/` decorator
                 if let Some((first, _)) = line.split_once("*/")
                     && !first.trim().is_empty()
@@ -326,6 +346,8 @@ impl<'ast> CommentGatherer<'ast> {
                     res.push(format_doc_block_comment(first.trim_end(), self.tab_width));
                 }
                 res.push(" */".to_string());
+            } else {
+                res.push(format_doc_block_comment(&line, self.tab_width));
             }
         }
         res
@@ -379,7 +401,7 @@ fn format_doc_block_comment(line: &str, tab_width: Option<usize>) -> String {
         return (" *").to_string();
     }
 
-    if let Some((_, rest_of_line)) = line.split_once("*") {
+    if let Some((_, rest_of_line)) = line.split_once('*') {
         if rest_of_line.is_empty() {
             (" *").to_string()
         } else if let Some(tab_width) = tab_width {
@@ -436,12 +458,10 @@ pub fn line_with_tabs(
                 (num_tabs, num_spaces) = (num_tabs + 1, 0);
             }
         }
-        Some(Consolidation::WithoutSpaces) => {
-            if num_spaces != 0 {
-                (num_tabs, num_spaces) = (num_tabs + 1, 0);
-            }
+        Some(Consolidation::WithoutSpaces) if num_spaces != 0 => {
+            (num_tabs, num_spaces) = (num_tabs + 1, 0);
         }
-        None => (),
+        _ => (),
     };
 
     // Append the normalized indentation and the rest of the line to the output

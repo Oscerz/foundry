@@ -38,22 +38,25 @@ pub(super) struct CallContext {
 
     /// The size of the callee's head, excluding its arguments.
     pub(super) size: usize,
+
+    /// Whether this chain context added its own indentation box.
+    pub(super) has_indent: bool,
 }
 
 impl CallContext {
-    pub(super) fn nested(size: usize) -> Self {
-        Self { kind: CallContextKind::Nested, size }
+    pub(super) const fn nested(size: usize) -> Self {
+        Self { kind: CallContextKind::Nested, size, has_indent: false }
     }
 
-    pub(super) fn chained(size: usize) -> Self {
-        Self { kind: CallContextKind::Chained, size }
+    pub(super) const fn chained(size: usize, has_indent: bool) -> Self {
+        Self { kind: CallContextKind::Chained, size, has_indent }
     }
 
-    pub(super) fn is_nested(&self) -> bool {
+    pub(super) const fn is_nested(&self) -> bool {
         matches!(self.kind, CallContextKind::Nested)
     }
 
-    pub(super) fn is_chained(&self) -> bool {
+    pub(super) const fn is_chained(&self) -> bool {
         matches!(self.kind, CallContextKind::Chained)
     }
 }
@@ -61,7 +64,6 @@ impl CallContext {
 #[derive(Debug, Default)]
 pub(super) struct CallStack {
     stack: Vec<CallContext>,
-    precall_size: usize,
 }
 
 impl Deref for CallStack {
@@ -80,21 +82,24 @@ impl CallStack {
         self.stack.pop()
     }
 
-    pub(crate) fn add_precall(&mut self, size: usize) {
-        self.precall_size += size;
-    }
-
-    pub(crate) fn reset_precall(&mut self) {
-        self.precall_size = 0;
-    }
-
     pub(crate) fn is_nested(&self) -> bool {
         self.last().is_some_and(|call| call.is_nested())
     }
 
-    pub(crate) fn is_chain(&self) -> bool {
-        self.last().is_some_and(|call| call.is_chained())
+    /// Returns true if the direct parent chain has its own indentation.
+    /// Used to determine if commasep should skip its own indentation (to avoid double indent).
+    pub(crate) const fn has_indented_parent_chain(&self) -> bool {
+        matches!(
+            self.stack.as_slice(),
+            [.., parent, last] if last.is_nested() && parent.is_chained() && parent.has_indent
+        )
     }
+}
+
+#[derive(Clone, Copy)]
+struct ChainedNamedCall {
+    callee: Span,
+    keep_inline: bool,
 }
 
 pub(super) struct State<'sess, 'ast> {
@@ -126,6 +131,8 @@ pub(super) struct State<'sess, 'ast> {
     return_bin_expr: bool,
     // Whether inside a call with call options and at least one argument.
     call_with_opts_and_args: bool,
+    // Callee of the current chained call with named arguments, if any.
+    chained_named_call: Option<ChainedNamedCall>,
     // Whether to skip the index soft breaks because the callee fits inline.
     skip_index_break: bool,
     // Whether inside an `emit` or `revert` call with a qualified path, or not.
@@ -156,13 +163,19 @@ struct SourcePos {
 }
 
 impl SourcePos {
+    /// While `enabled`, the position is a loose lower bound that is resynced by `advance_to`.
+    /// While disabled, it is the exact start of the not-yet-printed source of a disabled region.
     pub(super) fn advance(&mut self, bytes: u32) {
         self.pos += BytePos(bytes);
     }
 
     pub(super) fn advance_to(&mut self, pos: BytePos, enabled: bool) {
-        self.pos = std::cmp::max(pos, self.pos);
-        self.enabled = enabled;
+        // Ignore stale updates while disabled, as the exact position must be preserved until the
+        // remainder of the disabled region has been printed.
+        if self.enabled || pos >= self.pos {
+            self.pos = std::cmp::max(pos, self.pos);
+            self.enabled = enabled;
+        }
     }
 
     pub(super) fn next_line(&mut self, is_at_crlf: bool) {
@@ -182,15 +195,13 @@ pub(super) enum Separator {
 }
 
 impl Separator {
-    fn print(&self, p: &mut pp::Printer, cursor: &mut SourcePos, is_at_crlf: bool) {
+    fn print(&self, p: &mut pp::Printer) {
         match self {
             Self::Nbsp => p.nbsp(),
             Self::Space => p.space(),
             Self::Hardbreak => p.hardbreak(),
             Self::SpaceOrNbsp(breaks) => p.space_or_nbsp(*breaks),
         }
-
-        cursor.next_line(is_at_crlf);
     }
 }
 
@@ -198,6 +209,7 @@ impl Separator {
 impl<'sess> State<'sess, '_> {
     pub(super) fn new(
         sm: &'sess SourceMap,
+        start_pos: BytePos,
         config: Arc<FormatterConfig>,
         inline_config: InlineConfig<()>,
         comments: Comments,
@@ -205,22 +217,19 @@ impl<'sess> State<'sess, '_> {
         Self {
             s: pp::Printer::new(
                 config.line_length,
-                if matches!(config.style, IndentStyle::Tab) {
-                    Some(config.tab_width)
-                } else {
-                    None
-                },
+                matches!(config.style, IndentStyle::Tab).then(|| config.tab_width),
             ),
             ind: config.tab_width as isize,
             sm,
             comments,
             config,
             inline_config,
-            cursor: SourcePos { pos: BytePos::from_u32(0), enabled: true },
+            cursor: SourcePos { pos: start_pos, enabled: true },
             has_crlf: false,
             contract: None,
             single_line_stmt: None,
             call_with_opts_and_args: false,
+            chained_named_call: None,
             skip_index_break: false,
             binary_expr: None,
             return_bin_expr: false,
@@ -248,6 +257,17 @@ impl<'sess> State<'sess, '_> {
     /// The check is only meaningful if `self.has_crlf` is true.
     fn is_at_crlf(&self) -> bool {
         self.has_crlf && self.char_at(self.cursor.pos) == Some('\r')
+    }
+
+    /// Advances the cursor past the line break assumed to be represented by a printed separator.
+    ///
+    /// While the cursor is disabled it marks the exact start of not-yet-printed source, so it may
+    /// only advance if it actually sits at a line break; otherwise the separator does not consume
+    /// any source (e.g. it was already printed verbatim by a disabled trailing comment).
+    fn cursor_next_line(&mut self) {
+        if self.cursor.enabled || matches!(self.char_at(self.cursor.pos), Some('\n' | '\r')) {
+            self.cursor.next_line(self.is_at_crlf());
+        }
     }
 
     /// Computes the space left, bounded by the max space left.
@@ -303,6 +323,31 @@ impl State<'_, '_> {
     fn char_at(&self, pos: BytePos) -> Option<char> {
         let res = self.sm.lookup_byte_offset(pos);
         res.sf.src.get(res.pos.to_usize()..)?.chars().next()
+    }
+
+    /// Returns the position of the first `{` within the span, ignoring the ones inside comments.
+    fn find_opening_brace(&self, span: Span) -> Option<BytePos> {
+        self.find_uncommented_char(span, '{')
+    }
+
+    /// Returns the position of the first matching character within the span, ignoring comments.
+    fn find_uncommented_char(&self, span: Span, needle: char) -> Option<BytePos> {
+        let snip = self.sm.span_to_snippet(span).ok()?;
+        let mut idx = 0;
+        while idx < snip.len() {
+            let rest = &snip[idx..];
+            if rest.starts_with(needle) {
+                return Some(span.lo() + idx as u32);
+            }
+            idx += if let Some(line) = rest.strip_prefix("//") {
+                2 + line.find('\n').unwrap_or(line.len())
+            } else if let Some(block) = rest.strip_prefix("/*") {
+                2 + block.find("*/").map_or(block.len(), |end| end + 2)
+            } else {
+                rest.chars().next().map_or(1, char::len_utf8)
+            };
+        }
+        None
     }
 
     fn print_span(&mut self, span: Span) {
@@ -379,8 +424,8 @@ impl State<'_, '_> {
     }
 
     fn print_sep_unhandled(&mut self, sep: Separator) {
-        let is_at_crlf = self.is_at_crlf();
-        sep.print(&mut self.s, &mut self.cursor, is_at_crlf);
+        sep.print(&mut self.s);
+        self.cursor_next_line();
     }
 
     fn print_ident(&mut self, ident: &ast::Ident) {
@@ -444,8 +489,8 @@ impl State<'_, '_> {
                 // - ends with ',' a line break or a space are required.
                 // - ends with ';' a line break is required.
                 prev_needs_space = match line.chars().next_back() {
-                    Some('[') | Some('(') | Some('{') => self.config.bracket_spacing,
-                    Some(',') | Some(';') => true,
+                    Some('[' | '(' | '{') => self.config.bracket_spacing,
+                    Some(',' | ';') => true,
                     _ => false,
                 };
             }
@@ -486,11 +531,11 @@ impl<'sess> State<'sess, '_> {
     }
 
     fn cmnt_config(&self) -> CommentConfig {
-        CommentConfig { ..Default::default() }
+        Default::default()
     }
 
-    fn print_docs(&mut self, docs: &'_ ast::DocComments<'_>) {
-        // Intetionally no-op. Handled with `self.comments`.
+    const fn print_docs(&mut self, docs: &'_ ast::DocComments<'_>) {
+        // Intentionally no-op. Handled with `self.comments`.
         let _ = docs;
     }
 
@@ -503,6 +548,7 @@ impl<'sess> State<'sess, '_> {
         let mut is_leading = true;
         let config_cache = config;
         let mut buffered_blank = None;
+        let mut previous_mixed_at_bol = false;
         while self.peek_comment().is_some_and(|c| c.pos() < pos) {
             let mut cmnt = self.next_comment().unwrap();
             let style_cache = cmnt.style;
@@ -567,12 +613,25 @@ impl<'sess> State<'sess, '_> {
                 self.print_comment(blank, config);
             }
 
+            if previous_mixed_at_bol
+                && cmnt.style.is_trailing()
+                && matches!(cmnt.kind, ast::CommentKind::Line)
+            {
+                self.hardbreak_if_not_bol();
+            }
+
             // Handle mixed with follow-up comment
             if cmnt.style.is_mixed() {
                 if let Some(cmnt) = self.peek_comment_before(pos) {
                     config.mixed_no_break_prev = true;
                     config.mixed_no_break_post = true;
-                    config.mixed_post_nbsp = cmnt.style.is_mixed();
+                    config.mixed_post_nbsp = false;
+                    // The separator within a run of mixed comments must never break, even with
+                    // `wrap_comments`: a breakable space inside a broken consistent box always
+                    // breaks, which splits the run and reclassifies its comments on the next run.
+                    if cmnt.style.is_mixed() {
+                        config = config.mixed_post_glued();
+                    }
                 }
 
                 // Ensure consecutive mixed comments don't have a double-space
@@ -589,6 +648,7 @@ impl<'sess> State<'sess, '_> {
             }
 
             last_style = Some(cmnt.style);
+            previous_mixed_at_bol = cmnt.style.is_mixed() && self.is_bol_or_only_ind();
             self.print_comment(cmnt, config);
             config = config_cache;
         }
@@ -711,16 +771,23 @@ impl<'sess> State<'sess, '_> {
             if i + 1 < lines.len() {
                 let next_line = &lines[i + 1];
 
-                // Check if next line is has the same prefix and is not empty
+                // Check if next line has the same prefix and is not empty.
                 if next_line.starts_with(prefix) && !next_line.trim().is_empty() {
+                    let next_content = next_line[prefix.len()..].trim_start();
+
+                    // Keep each NatSpec tag on its own doc-comment line. Merging a wrapped
+                    // `@dev`/`@param` line with the following tag changes the tag boundary.
+                    if next_content.starts_with('@') {
+                        result.push(current_line.clone());
+                        i += 1;
+                        continue;
+                    }
+
                     // Only merge if the current line doesn't fit within available width
                     if estimate_line_width(current_line, self.config.tab_width) > self.space_left()
                     {
                         // Merge the lines and let the wrapper handle breaking if needed
-                        let merged_line = format!(
-                            "{current_line} {next_content}",
-                            next_content = &next_line[prefix.len()..].trim_start()
-                        );
+                        let merged_line = format!("{current_line} {next_content}");
                         result.push(merged_line);
 
                         // Skip both lines since they are merged
@@ -749,6 +816,7 @@ impl<'sess> State<'sess, '_> {
             CommentStyle::Mixed => {
                 let Some(prefix) = cmnt.prefix() else { return };
                 let never_break = self.last_token_is_neverbreak();
+                let starts_line = self.is_bol_or_only_ind() || self.last_token_is_break();
                 if !self.is_bol_or_only_ind() {
                     match (never_break || config.mixed_no_break_prev, config.mixed_prev_space) {
                         (false, true) => config.space(&mut self.s),
@@ -759,6 +827,9 @@ impl<'sess> State<'sess, '_> {
                 }
                 if self.config.wrap_comments {
                     // Merge and wrap comments
+                    if starts_line {
+                        self.ibox(config.offset);
+                    }
                     let merged_lines = self.merge_comment_lines(&cmnt.lines, prefix);
                     for (pos, line) in merged_lines.into_iter().delimited() {
                         self.print_wrapped_line(&line, prefix, 0, cmnt.is_doc);
@@ -766,17 +837,28 @@ impl<'sess> State<'sess, '_> {
                             self.hardbreak();
                         }
                     }
+                    if starts_line {
+                        self.end();
+                    }
                 } else {
-                    // No wrapping, print as-is
+                    // Match the opening-column normalization of continuation lines.
+                    self.visual_align();
                     for (pos, line) in cmnt.lines.into_iter().delimited() {
-                        self.word(line);
+                        if !line.is_empty() {
+                            self.word(line);
+                        }
                         if !pos.is_last {
                             self.hardbreak();
                         }
                     }
+                    self.end();
                 }
                 if config.mixed_post_nbsp {
-                    config.nbsp_or_space(self.config.wrap_comments, &mut self.s);
+                    if config.mixed_post_glued {
+                        self.nbsp();
+                    } else {
+                        config.nbsp_or_space(self.config.wrap_comments, &mut self.s);
+                    }
                     self.cursor.advance(1);
                 } else if !config.mixed_no_break_post {
                     config.space(&mut self.s);
@@ -939,6 +1021,14 @@ impl<'sess> State<'sess, '_> {
         self.comments.iter().take_while(|c| c.pos() < pos).find(|c| !c.style.is_blank())
     }
 
+    /// Returns `true` if the next comment is a mixed comment that starts before the given
+    /// position.
+    fn peek_mixed_comment_before(&self, pos: Option<BytePos>) -> bool {
+        pos.is_some_and(|pos| {
+            self.peek_comment().is_some_and(|cmnt| cmnt.pos() < pos && cmnt.style.is_mixed())
+        })
+    }
+
     fn has_comment_before_with<F>(&self, pos: BytePos, f: F) -> bool
     where
         F: FnMut(&Comment) -> bool,
@@ -952,12 +1042,20 @@ impl<'sess> State<'sess, '_> {
     {
         self.comments
             .iter()
-            .take_while(|c| pos_lo < c.pos() && c.pos() < pos_hi)
+            .skip_while(|c| c.pos() < pos_lo)
+            .take_while(|c| c.pos() < pos_hi)
             .find(|c| !c.style.is_blank())
     }
 
     fn has_comment_between(&self, start_pos: BytePos, end_pos: BytePos) -> bool {
         self.comments.iter().filter(|c| c.pos() > start_pos && c.pos() < end_pos).any(|_| true)
+    }
+
+    fn has_breakable_comment_between(&self, start_pos: BytePos, end_pos: BytePos) -> bool {
+        self.comments
+            .iter()
+            .filter(|comment| comment.pos() >= start_pos && comment.pos() < end_pos)
+            .any(|comment| !comment.style.is_blank())
     }
 
     pub(crate) fn next_comment(&mut self) -> Option<Comment> {
@@ -1052,6 +1150,10 @@ pub(crate) struct CommentConfig {
     // Config: mixed comments
     mixed_prev_space: bool,
     mixed_post_nbsp: bool,
+    /// Makes `mixed_post_nbsp` emit a hard space even with `wrap_comments`, which would
+    /// otherwise use a breakable one. Required when the comment is glued to a closing token, as
+    /// a break in between detaches it and reclassifies the comment on the next run.
+    mixed_post_glued: bool,
     mixed_no_break_prev: bool,
     mixed_no_break_post: bool,
 }
@@ -1059,6 +1161,12 @@ pub(crate) struct CommentConfig {
 impl CommentConfig {
     pub(crate) fn skip_ws() -> Self {
         Self { skip_blanks: Some(Skip::All), ..Default::default() }
+    }
+
+    /// Config for comments that are the sole content of an otherwise empty block, so that they
+    /// are surrounded by spaces: `{ /* comment */ }`.
+    pub(crate) fn empty_block() -> Self {
+        Self::skip_ws().mixed_no_break().mixed_prev_space().mixed_post_glued()
     }
 
     pub(crate) fn skip_leading_ws(resettable: bool) -> Self {
@@ -1069,12 +1177,12 @@ impl CommentConfig {
         Self { skip_blanks: Some(Skip::Trailing), ..Default::default() }
     }
 
-    pub(crate) fn offset(mut self, off: isize) -> Self {
+    pub(crate) const fn offset(mut self, off: isize) -> Self {
         self.offset = off;
         self
     }
 
-    pub(crate) fn no_breaks(mut self) -> Self {
+    pub(crate) const fn no_breaks(mut self) -> Self {
         self.iso_no_break = true;
         self.trailing_no_break = true;
         self.mixed_no_break_prev = true;
@@ -1082,29 +1190,35 @@ impl CommentConfig {
         self
     }
 
-    pub(crate) fn trailing_no_break(mut self) -> Self {
+    pub(crate) const fn trailing_no_break(mut self) -> Self {
         self.trailing_no_break = true;
         self
     }
 
-    pub(crate) fn mixed_no_break(mut self) -> Self {
+    pub(crate) const fn mixed_no_break(mut self) -> Self {
         self.mixed_no_break_prev = true;
         self.mixed_no_break_post = true;
         self
     }
 
-    pub(crate) fn mixed_no_break_post(mut self) -> Self {
+    pub(crate) const fn mixed_no_break_post(mut self) -> Self {
         self.mixed_no_break_post = true;
         self
     }
 
-    pub(crate) fn mixed_prev_space(mut self) -> Self {
+    pub(crate) const fn mixed_prev_space(mut self) -> Self {
         self.mixed_prev_space = true;
         self
     }
 
-    pub(crate) fn mixed_post_nbsp(mut self) -> Self {
+    pub(crate) const fn mixed_post_nbsp(mut self) -> Self {
         self.mixed_post_nbsp = true;
+        self
+    }
+
+    pub(crate) const fn mixed_post_glued(mut self) -> Self {
+        self.mixed_post_nbsp = true;
+        self.mixed_post_glued = true;
         self
     }
 
@@ -1138,15 +1252,13 @@ impl CommentConfig {
 }
 
 fn snippet_with_tabs(s: String, tab_width: usize) -> String {
-    // process leading breaks
-    let trimmed = s.trim_start_matches('\n');
-    let num_breaks = s.len() - trimmed.len();
-    let mut formatted = std::iter::repeat_n('\n', num_breaks).collect::<String>();
-
-    // process lines
-    for (pos, line) in trimmed.lines().delimited() {
+    let mut formatted = String::with_capacity(s.len());
+    for line in s.split_inclusive('\n') {
+        let (line, has_newline) =
+            line.strip_suffix('\n').map_or((line, false), |line| (line, true));
+        let line = line.strip_suffix('\r').unwrap_or(line);
         line_with_tabs(&mut formatted, line, tab_width, None);
-        if !pos.is_last {
+        if has_newline {
             formatted.push('\n');
         }
     }
