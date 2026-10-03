@@ -23,7 +23,7 @@ impl IntValueTree {
     /// # Arguments
     /// * `start` - Starting value for the tree
     /// * `fixed` - If `true` the tree would only contain one element and won't be simplified.
-    fn new(start: I256, fixed: bool) -> Self {
+    const fn new(start: I256, fixed: bool) -> Self {
         Self { lo: I256::ZERO, curr: start, hi: start, fixed }
     }
 
@@ -183,17 +183,12 @@ impl IntStrategy {
         };
 
         // init I256 from 2 randoms
-        let mut inner: [u64; 4] = [0; 4];
-        let mask64 = (1 << 65) - 1;
-        inner[0] = (lower & mask64) as u64;
-        inner[1] = (lower >> 64) as u64;
-        inner[2] = (higher & mask64) as u64;
-        inner[3] = (higher >> 64) as u64;
+        let magnitude = (U256::from(higher) << 128) | U256::from(lower);
 
         // we have a small bias here, i.e. intN::min will never be generated
         // but it's ok since it's generated in `fn generate_edge_tree(...)`
         let sign = if rng.random::<bool>() { Sign::Positive } else { Sign::Negative };
-        let (start, _) = I256::overflowing_from_sign_and_abs(sign, U256::from_limbs(inner));
+        let (start, _) = I256::overflowing_from_sign_and_abs(sign, magnitude);
 
         Ok(IntValueTree::new(start, false))
     }

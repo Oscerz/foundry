@@ -1,6 +1,11 @@
 //! Tests for the `forge compiler` command.
 
-use foundry_test_utils::snapbox::IntoData;
+use foundry_compilers::compilers::solc::Solc;
+use foundry_test_utils::{
+    snapbox::IntoData,
+    util::{SOLC_VERSION, get_vyper},
+};
+use path_slash::PathBufExt;
 
 const CONTRACT_A: &str = r#"
 // SPDX-license-identifier: MIT
@@ -18,14 +23,14 @@ contract ContractB {}
 
 const CONTRACT_C: &str = r#"
 // SPDX-license-identifier: MIT
-pragma solidity 0.8.30;
+pragma solidity 0.8.33;
 
 contract ContractC {}
 "#;
 
 const CONTRACT_D: &str = r#"
 // SPDX-license-identifier: MIT
-pragma solidity 0.8.30;
+pragma solidity 0.8.33;
 
 contract ContractD {}
 "#;
@@ -63,7 +68,8 @@ def increment() -> uint256:
     return self.number
 "#;
 
-forgetest!(can_resolve_path, |prj, cmd| {
+#[forgetest]
+fn can_resolve_path(prj: _, cmd: _) {
     prj.add_source("ContractA", CONTRACT_A);
 
     cmd.args(["compiler", "resolve", "--root", prj.root().to_str().unwrap()])
@@ -74,9 +80,10 @@ Solidity:
 
 
 "#]]);
-});
+}
 
-forgetest!(can_list_resolved_compiler_versions, |prj, cmd| {
+#[forgetest]
+fn can_list_resolved_compiler_versions(prj: _, cmd: _) {
     prj.add_source("ContractA", CONTRACT_A);
 
     cmd.args(["compiler", "resolve"]).assert_success().stdout_eq(str![[r#"
@@ -85,9 +92,42 @@ Solidity:
 
 
 "#]]);
-});
+}
 
-forgetest!(can_list_resolved_compiler_versions_json, |prj, cmd| {
+#[forgetest_init]
+fn can_print_resolved_compiler_path(prj: _, cmd: _) {
+    prj.add_source("Contract", "contract Contract {}");
+    let solc = Solc::find_svm_installed_version(&SOLC_VERSION.parse().unwrap()).unwrap().unwrap();
+
+    cmd.args(["compiler", "resolve", "--path"])
+        .assert_success()
+        .stdout_eq(format!("{}\n", solc.solc.to_slash_lossy()));
+}
+
+#[forgetest]
+fn can_print_resolved_vyper_path(prj: _, cmd: _) {
+    let vyper = get_vyper();
+    prj.add_raw_source("ICounter.vyi", VYPER_INTERFACE);
+    prj.add_raw_source("Counter.vy", VYPER_CONTRACT);
+    prj.update_config(|config| config.vyper.path = Some(vyper.path.clone()));
+
+    cmd.args(["compiler", "resolve", "--path"])
+        .assert_success()
+        .stdout_eq(format!("{}\n", vyper.path.display()));
+}
+
+#[forgetest]
+fn compiler_path_requires_single_version(prj: _, cmd: _) {
+    prj.add_source("ContractA", CONTRACT_A);
+    prj.add_source("ContractB", CONTRACT_B);
+
+    cmd.args(["compiler", "resolve", "--path"]).assert_failure().stdout_eq("").stderr_eq(
+        "Error: multiple compilers resolved; use `forge compiler resolve` to inspect them\n",
+    );
+}
+
+#[forgetest]
+fn can_list_resolved_compiler_versions_json(prj: _, cmd: _) {
     prj.add_source("ContractA", CONTRACT_A);
 
     cmd.args(["compiler", "resolve", "--json"]).assert_success().stdout_eq(
@@ -102,24 +142,26 @@ forgetest!(can_list_resolved_compiler_versions_json, |prj, cmd| {
 "#]]
         .is_json(),
     );
-});
+}
 
-forgetest!(can_list_resolved_compiler_versions_verbose, |prj, cmd| {
+#[forgetest]
+fn can_list_resolved_compiler_versions_verbose(prj: _, cmd: _) {
     prj.add_source("ContractC", CONTRACT_C);
     prj.add_source("ContractD", CONTRACT_D);
 
     cmd.args(["compiler", "resolve", "-v"]).assert_success().stdout_eq(str![[r#"
 Solidity:
 
-0.8.30:
+0.8.33:
 ├── src/ContractC.sol
 └── src/ContractD.sol
 
 
 "#]]);
-});
+}
 
-forgetest!(can_list_resolved_compiler_versions_verbose_json, |prj, cmd| {
+#[forgetest]
+fn can_list_resolved_compiler_versions_verbose_json(prj: _, cmd: _) {
     prj.add_source("ContractC", CONTRACT_C);
     prj.add_source("ContractD", CONTRACT_D);
 
@@ -128,7 +170,7 @@ forgetest!(can_list_resolved_compiler_versions_verbose_json, |prj, cmd| {
 {
   "Solidity": [
     {
-      "version": "0.8.30",
+      "version": "0.8.33",
       "paths": [
         "src/ContractC.sol",
         "src/ContractD.sol"
@@ -139,9 +181,10 @@ forgetest!(can_list_resolved_compiler_versions_verbose_json, |prj, cmd| {
 "#]]
         .is_json(),
     );
-});
+}
 
-forgetest!(can_list_resolved_multiple_compiler_versions, |prj, cmd| {
+#[forgetest]
+fn can_list_resolved_multiple_compiler_versions(prj: _, cmd: _) {
     prj.add_source("ContractA", CONTRACT_A);
     prj.add_source("ContractB", CONTRACT_B);
     prj.add_source("ContractC", CONTRACT_C);
@@ -153,16 +196,17 @@ forgetest!(can_list_resolved_multiple_compiler_versions, |prj, cmd| {
 Solidity:
 - 0.8.4
 - 0.8.11
-- 0.8.30
+- 0.8.33
 
 Vyper:
 - 0.4.3
 
 
 "#]]);
-});
+}
 
-forgetest!(can_list_resolved_multiple_compiler_versions_skipped, |prj, cmd| {
+#[forgetest]
+fn can_list_resolved_multiple_compiler_versions_skipped(prj: _, cmd: _) {
     prj.add_source("ContractA", CONTRACT_A);
     prj.add_source("ContractB", CONTRACT_B);
     prj.add_source("ContractC", CONTRACT_C);
@@ -181,9 +225,10 @@ Vyper:
 
 "#
     ]]);
-});
+}
 
-forgetest!(can_list_resolved_multiple_compiler_versions_skipped_json, |prj, cmd| {
+#[forgetest]
+fn can_list_resolved_multiple_compiler_versions_skipped_json(prj: _, cmd: _) {
     prj.add_source("ContractA", CONTRACT_A);
     prj.add_source("ContractB", CONTRACT_B);
     prj.add_source("ContractC", CONTRACT_C);
@@ -198,7 +243,7 @@ forgetest!(can_list_resolved_multiple_compiler_versions_skipped_json, |prj, cmd|
 {
   "Solidity": [
     {
-      "version": "0.8.30",
+      "version": "0.8.33",
       "paths": [
         "src/ContractD.sol"
       ]
@@ -217,9 +262,10 @@ forgetest!(can_list_resolved_multiple_compiler_versions_skipped_json, |prj, cmd|
 "#]]
             .is_json(),
         );
-});
+}
 
-forgetest!(can_list_resolved_multiple_compiler_versions_verbose, |prj, cmd| {
+#[forgetest]
+fn can_list_resolved_multiple_compiler_versions_verbose(prj: _, cmd: _) {
     prj.add_source("ContractA", CONTRACT_A);
     prj.add_source("ContractB", CONTRACT_B);
     prj.add_source("ContractC", CONTRACT_C);
@@ -236,7 +282,7 @@ Solidity:
 0.8.11 (<= london):
 └── src/ContractB.sol
 
-0.8.30 (<= prague):
+0.8.33 (<= prague):
 ├── src/ContractC.sol
 └── src/ContractD.sol
 
@@ -248,9 +294,10 @@ Vyper:
 
 
 "#]]);
-});
+}
 
-forgetest!(can_list_resolved_multiple_compiler_versions_verbose_json, |prj, cmd| {
+#[forgetest]
+fn can_list_resolved_multiple_compiler_versions_verbose_json(prj: _, cmd: _) {
     prj.add_source("ContractA", CONTRACT_A);
     prj.add_source("ContractB", CONTRACT_B);
     prj.add_source("ContractC", CONTRACT_C);
@@ -277,7 +324,7 @@ forgetest!(can_list_resolved_multiple_compiler_versions_verbose_json, |prj, cmd|
       ]
     },
     {
-      "version": "0.8.30",
+      "version": "0.8.33",
       "evm_version": "[..]",
       "paths": [
         "src/ContractC.sol",
@@ -299,4 +346,4 @@ forgetest!(can_list_resolved_multiple_compiler_versions_verbose_json, |prj, cmd|
 "#]]
         .is_json(),
     );
-});
+}
