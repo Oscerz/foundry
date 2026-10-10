@@ -1,21 +1,47 @@
+use super::{CIP64_TX_TYPE, TxCip64};
 use alloy_consensus::{
-    Sealed, Signed, TransactionEnvelope, TxEip1559, TxEip2930, TxEnvelope, TxLegacy, Typed2718,
+    SignableTransaction, Signed, TransactionEnvelope, TxEip1559, TxEip2930, TxEnvelope, TxLegacy,
+    TxType, Typed2718,
+    crypto::RecoveryError,
     transaction::{
-        TxEip7702,
+        SignerRecoverable, TxEip7702, TxHashRef,
         eip4844::{TxEip4844Variant, TxEip4844WithSidecar},
     },
 };
-use alloy_evm::FromRecoveredTx;
-use alloy_network::{AnyRpcTransaction, AnyTxEnvelope};
-use alloy_primitives::{Address, B256};
-use alloy_rlp::Encodable;
+use alloy_evm::{FromRecoveredTx, FromTxWithEncoded};
+use alloy_network::{
+    AnyRpcTransaction, AnyTxEnvelope, TransactionResponse, eip2718::Encodable2718,
+};
+use alloy_primitives::{Address, B256, Bytes, Signature, TxHash};
 use alloy_rpc_types::ConversionError;
-use alloy_serde::WithOtherFields;
-use op_alloy_consensus::{DEPOSIT_TX_TYPE_ID, OpTransaction as OpTransactionTrait, TxDeposit};
-use op_revm::{OpTransaction, transaction::deposit::DepositTransactionParts};
 use revm::context::TxEnv;
+use tempo_primitives::{AASigned, TEMPO_TX_TYPE_ID, TempoSignature, TempoTransaction};
+use tempo_revm::TempoTxEnv;
 
+#[cfg(all(feature = "base", not(feature = "optimism")))]
+use op_alloy_consensus::{DEPOSIT_TX_TYPE_ID, TxDeposit};
+
+#[cfg(any(feature = "base", feature = "optimism"))]
+use alloy_consensus::Sealed;
+
+#[cfg(feature = "base")]
+use base_common_consensus::{BaseTxEnvelope, Eip8130Signed, TxEip8130};
+#[cfg(feature = "base")]
+use base_common_evm::EIP8130_TRANSACTION_TYPE;
+#[cfg(feature = "base")]
+use base_common_rpc_types::Transaction;
+
+#[cfg(feature = "optimism")]
+use alloy_consensus::Transaction as _;
+#[cfg(feature = "optimism")]
+use op_alloy_consensus::{
+    DEPOSIT_TX_TYPE_ID, POST_EXEC_TX_TYPE_ID, PostExecPayload, TxDeposit, TxPostExec,
+};
+
+//
 /// Container type for signed, typed transactions.
+// NOTE(onbjerg): Boxing `Tempo(AASigned)` breaks `TransactionEnvelope` derive macro trait bounds.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, TransactionEnvelope)]
 #[envelope(
     tx_type_name = FoundryTxType,
@@ -25,28 +51,105 @@ pub enum FoundryTxEnvelope {
     /// Legacy transaction type
     #[envelope(ty = 0)]
     Legacy(Signed<TxLegacy>),
-    /// EIP-2930 transaction
+    /// [EIP-2930] transaction.
+    ///
+    /// [EIP-2930]: https://eips.ethereum.org/EIPS/eip-2930
     #[envelope(ty = 1)]
     Eip2930(Signed<TxEip2930>),
-    /// EIP-1559 transaction
+    /// [EIP-1559] transaction.
+    ///
+    /// [EIP-1559]: https://eips.ethereum.org/EIPS/eip-1559
     #[envelope(ty = 2)]
     Eip1559(Signed<TxEip1559>),
-    /// EIP-4844 transaction
+    /// [EIP-4844] transaction.
+    ///
+    /// [EIP-4844]: https://eips.ethereum.org/EIPS/eip-4844
     #[envelope(ty = 3)]
     Eip4844(Signed<TxEip4844Variant>),
-    /// EIP-7702 transaction
+    /// [EIP-7702] transaction.
+    ///
+    /// [EIP-7702]: https://eips.ethereum.org/EIPS/eip-7702
     #[envelope(ty = 4)]
     Eip7702(Signed<TxEip7702>),
-    /// op-stack deposit transaction
+    /// OP stack deposit transaction.
+    ///
+    /// See <https://docs.optimism.io/op-stack/bridging/deposit-flow>.
+    #[cfg(any(feature = "base", feature = "optimism"))]
     #[envelope(ty = 126)]
     Deposit(Sealed<TxDeposit>),
+    /// OP stack post-execution synthetic transaction.
+    #[cfg(feature = "optimism")]
+    #[envelope(ty = 0x7D)]
+    PostExec(Sealed<TxPostExec>),
+    /// Base EIP-8130 account-abstraction transaction.
+    #[cfg(feature = "base")]
+    #[envelope(ty = 0x79, typed = TxEip8130)]
+    Eip8130(Eip8130Signed),
+    /// Tempo transaction type.
+    ///
+    /// See <https://docs.tempo.xyz/protocol/transactions>.
+    #[envelope(ty = 0x76, typed = TempoTransaction)]
+    Tempo(AASigned),
+    /// Celo CIP-64 dynamic fee transaction.
+    #[envelope(ty = 0x7b)]
+    Celo(Signed<TxCip64>),
 }
 
 impl FoundryTxEnvelope {
-    /// Converts the transaction into a [`TxEnvelope`].
+    /// Returns `true` if this is a legacy transaction.
+    #[inline]
+    pub const fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy(_))
+    }
+
+    /// Returns `true` if this is an EIP-2930 transaction.
+    #[inline]
+    pub const fn is_eip2930(&self) -> bool {
+        matches!(self, Self::Eip2930(_))
+    }
+
+    /// Returns `true` if this is an EIP-1559 transaction.
+    #[inline]
+    pub const fn is_eip1559(&self) -> bool {
+        matches!(self, Self::Eip1559(_))
+    }
+
+    /// Returns `true` if this is an EIP-4844 transaction.
+    #[inline]
+    pub const fn is_eip4844(&self) -> bool {
+        matches!(self, Self::Eip4844(_))
+    }
+
+    /// Returns `true` if this is an EIP-7702 transaction.
+    #[inline]
+    pub const fn is_eip7702(&self) -> bool {
+        matches!(self, Self::Eip7702(_))
+    }
+
+    /// Returns `true` if this is an OP stack deposit transaction.
+    #[cfg(any(feature = "base", feature = "optimism"))]
+    #[inline]
+    pub const fn is_deposit(&self) -> bool {
+        matches!(self, Self::Deposit(_))
+    }
+
+    /// Returns `true` if this is an OP stack post-execution synthetic transaction.
+    #[cfg(feature = "optimism")]
+    #[inline]
+    pub const fn is_post_exec(&self) -> bool {
+        matches!(self, Self::PostExec(_))
+    }
+
+    /// Returns `true` if this is a Base EIP-8130 transaction.
+    #[cfg(feature = "base")]
+    #[inline]
+    pub const fn is_eip8130(&self) -> bool {
+        matches!(self, Self::Eip8130(_))
+    }
+
+    /// Converts the transaction into an Ethereum [`TxEnvelope`].
     ///
-    /// Returns an error if the transaction is a Deposit transaction, which is not part of the
-    /// standard Ethereum transaction types.
+    /// Returns an error if the transaction is not part of the standard Ethereum transaction types.
     pub fn try_into_eth(self) -> Result<TxEnvelope, Self> {
         match self {
             Self::Legacy(tx) => Ok(TxEnvelope::Legacy(tx)),
@@ -54,11 +157,17 @@ impl FoundryTxEnvelope {
             Self::Eip1559(tx) => Ok(TxEnvelope::Eip1559(tx)),
             Self::Eip4844(tx) => Ok(TxEnvelope::Eip4844(tx)),
             Self::Eip7702(tx) => Ok(TxEnvelope::Eip7702(tx)),
+            #[cfg(any(feature = "base", feature = "optimism"))]
             Self::Deposit(_) => Err(self),
+            #[cfg(feature = "optimism")]
+            Self::PostExec(_) => Err(self),
+            #[cfg(feature = "base")]
+            Self::Eip8130(_) => Err(self),
+            Self::Tempo(_) | Self::Celo(_) => Err(self),
         }
     }
 
-    pub fn sidecar(&self) -> Option<&TxEip4844WithSidecar> {
+    pub const fn sidecar(&self) -> Option<&TxEip4844WithSidecar> {
         match self {
             Self::Eip4844(signed_variant) => match signed_variant.tx() {
                 TxEip4844Variant::TxEip4844WithSidecar(with_sidecar) => Some(with_sidecar),
@@ -68,54 +177,209 @@ impl FoundryTxEnvelope {
         }
     }
 
-    /// Returns the hash of the transaction.
-    ///
-    /// Note: If this transaction has the Impersonated signature then this returns a modified unique
-    /// hash. This allows us to treat impersonated transactions as unique.
-    pub fn hash(&self) -> B256 {
+    /// Drops pooled sidecars so the transaction uses its canonical block-body representation.
+    pub fn into_canonical(self) -> Self {
         match self {
-            Self::Legacy(t) => *t.hash(),
-            Self::Eip2930(t) => *t.hash(),
-            Self::Eip1559(t) => *t.hash(),
-            Self::Eip4844(t) => *t.hash(),
-            Self::Eip7702(t) => *t.hash(),
-            Self::Deposit(t) => t.tx_hash(),
+            Self::Eip4844(tx) => Self::Eip4844(tx.map(TxEip4844Variant::drop_sidecar)),
+            tx => tx,
         }
     }
 
-    /// Returns the hash if the transaction is impersonated (using a fake signature)
+    /// Returns the hash of the transaction.
     ///
-    /// This appends the `address` before hashing it
-    pub fn impersonated_hash(&self, sender: Address) -> B256 {
-        let mut buffer = Vec::new();
-        Encodable::encode(self, &mut buffer);
-        buffer.extend_from_slice(sender.as_ref());
-        B256::from_slice(alloy_primitives::utils::keccak256(&buffer).as_slice())
+    /// # Note
+    ///
+    /// If this transaction has the Impersonated signature then this returns a modified unique
+    /// hash. This allows us to treat impersonated transactions as unique.
+    pub fn hash(&self) -> B256 {
+        *self.tx_hash()
+    }
+
+    /// Returns `true` if this is a Tempo transaction.
+    pub const fn is_tempo(&self) -> bool {
+        matches!(self, Self::Tempo(_))
+    }
+
+    /// Returns `true` if this is a Tempo transaction with a nonzero nonce key.
+    pub fn has_nonzero_tempo_nonce_key(&self) -> bool {
+        matches!(self, Self::Tempo(tx) if !tx.tx().nonce_key.is_zero())
     }
 
     /// Recovers the Ethereum address which was used to sign the transaction.
-    pub fn recover(&self) -> Result<Address, alloy_primitives::SignatureError> {
+    pub fn recover(&self) -> Result<Address, RecoveryError> {
+        Ok(match self {
+            Self::Legacy(tx) => tx.recover_signer()?,
+            Self::Eip2930(tx) => tx.recover_signer()?,
+            Self::Eip1559(tx) => tx.recover_signer()?,
+            Self::Celo(tx) => tx.recover_signer()?,
+            Self::Eip4844(tx) => tx.recover_signer()?,
+            Self::Eip7702(tx) => tx.recover_signer()?,
+            #[cfg(any(feature = "base", feature = "optimism"))]
+            Self::Deposit(tx) => tx.from,
+            #[cfg(feature = "optimism")]
+            Self::PostExec(tx) => tx.inner().signer_address(),
+            #[cfg(feature = "base")]
+            Self::Eip8130(tx) => tx.recover_sender()?,
+            Self::Tempo(tx) => tx.signature().recover_signer(&tx.signature_hash())?,
+        })
+    }
+
+    /// EIP-2718 encodes a transaction held in its JSON-RPC form.
+    ///
+    /// [`AnyTxEnvelope`] panics rather than encode a transaction type alloy does not model, so
+    /// anything that is not plain Ethereum is routed through [`Self`], which knows the types
+    /// Foundry supports. Chains that can be forked but not executed, such as Arbitrum and its
+    /// Orbit rollups, mint types with no Foundry envelope; only their RPC representation is ever
+    /// available, which is not enough to reconstruct their consensus encoding.
+    pub fn encode_rpc_2718(transaction: &AnyRpcTransaction) -> Result<Bytes, ConversionError> {
+        if let AnyTxEnvelope::Ethereum(envelope) = &*transaction.inner.inner {
+            return Ok(envelope.encoded_2718().into());
+        }
+
+        Ok(Self::try_from(transaction.clone())?.encoded_2718().into())
+    }
+}
+
+impl FoundryTxType {
+    /// Returns `true` if this is a legacy transaction type.
+    pub const fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+
+    /// Returns `true` if this is an EIP-2930 transaction type.
+    pub const fn is_eip2930(&self) -> bool {
+        matches!(self, Self::Eip2930)
+    }
+
+    /// Returns `true` if this is an EIP-1559 transaction type.
+    pub const fn is_eip1559(&self) -> bool {
+        matches!(self, Self::Eip1559)
+    }
+
+    /// Returns `true` if this is an EIP-4844 transaction type.
+    pub const fn is_eip4844(&self) -> bool {
+        matches!(self, Self::Eip4844)
+    }
+
+    /// Returns `true` if this is an EIP-7702 transaction type.
+    pub const fn is_eip7702(&self) -> bool {
+        matches!(self, Self::Eip7702)
+    }
+
+    /// Returns `true` if this is an OP stack deposit transaction type.
+    #[cfg(any(feature = "base", feature = "optimism"))]
+    pub const fn is_deposit(&self) -> bool {
+        matches!(self, Self::Deposit)
+    }
+
+    /// Returns `true` if this is an OP stack post-execution synthetic transaction type.
+    #[cfg(feature = "optimism")]
+    pub const fn is_post_exec(&self) -> bool {
+        matches!(self, Self::PostExec)
+    }
+
+    /// Returns `true` if this is a Base EIP-8130 transaction type.
+    #[cfg(feature = "base")]
+    pub const fn is_eip8130(&self) -> bool {
+        matches!(self, Self::Eip8130)
+    }
+
+    /// Returns `true` if this is a Tempo transaction type.
+    pub const fn is_tempo(&self) -> bool {
+        matches!(self, Self::Tempo)
+    }
+
+    /// Returns `true` if this is a Celo CIP-64 transaction type.
+    pub const fn is_celo(&self) -> bool {
+        matches!(self, Self::Celo)
+    }
+}
+
+impl FoundryTypedTx {
+    /// Builds an envelope with a dummy signature for an impersonated account.
+    ///
+    /// The signature uses `r = 1` and `s = 1` because clients reject zero scalar values.
+    pub fn into_impersonated(self) -> FoundryTxEnvelope {
+        let signature = Signature::from_scalars_and_parity(
+            B256::with_last_byte(1),
+            B256::with_last_byte(1),
+            false,
+        );
         match self {
-            Self::Legacy(tx) => tx.recover_signer(),
-            Self::Eip2930(tx) => tx.recover_signer(),
-            Self::Eip1559(tx) => tx.recover_signer(),
-            Self::Eip4844(tx) => tx.recover_signer(),
-            Self::Eip7702(tx) => tx.recover_signer(),
-            Self::Deposit(tx) => Ok(tx.from),
+            Self::Legacy(tx) => FoundryTxEnvelope::Legacy(tx.into_signed(signature)),
+            Self::Eip2930(tx) => FoundryTxEnvelope::Eip2930(tx.into_signed(signature)),
+            Self::Eip1559(tx) => FoundryTxEnvelope::Eip1559(tx.into_signed(signature)),
+            Self::Celo(tx) => FoundryTxEnvelope::Celo(tx.into_signed(signature)),
+            Self::Eip7702(tx) => FoundryTxEnvelope::Eip7702(tx.into_signed(signature)),
+            Self::Eip4844(tx) => FoundryTxEnvelope::Eip4844(tx.into_signed(signature)),
+            #[cfg(any(feature = "base", feature = "optimism"))]
+            Self::Deposit(tx) => FoundryTxEnvelope::Deposit(Sealed::new(tx)),
+            #[cfg(feature = "optimism")]
+            Self::PostExec(_) => {
+                unreachable!("op post-exec txs should not be impersonated")
+            }
+            #[cfg(feature = "base")]
+            Self::Eip8130(_) => {
+                unreachable!("EIP-8130 requires a signed raw transaction envelope")
+            }
+            Self::Tempo(tx) => {
+                let tempo_sig: TempoSignature = signature.into();
+                FoundryTxEnvelope::Tempo(tx.into_signed(tempo_sig))
+            }
+        }
+    }
+
+    /// Returns `true` if this is an OP stack deposit transaction.
+    #[cfg(any(feature = "base", feature = "optimism"))]
+    pub const fn is_deposit(&self) -> bool {
+        matches!(self, Self::Deposit(_))
+    }
+
+    /// Returns `true` if this is an OP stack post-execution synthetic transaction.
+    #[cfg(feature = "optimism")]
+    pub const fn is_post_exec(&self) -> bool {
+        matches!(self, Self::PostExec(_))
+    }
+
+    /// Returns `true` if this is a Base EIP-8130 transaction.
+    #[cfg(feature = "base")]
+    pub const fn is_eip8130(&self) -> bool {
+        matches!(self, Self::Eip8130(_))
+    }
+
+    /// Returns `true` if this is a Tempo transaction.
+    pub const fn is_tempo(&self) -> bool {
+        matches!(self, Self::Tempo(_))
+    }
+}
+
+impl TxHashRef for FoundryTxEnvelope {
+    fn tx_hash(&self) -> &TxHash {
+        match self {
+            Self::Legacy(t) => t.hash(),
+            Self::Eip2930(t) => t.hash(),
+            Self::Eip1559(t) => t.hash(),
+            Self::Celo(t) => t.hash(),
+            Self::Eip4844(t) => t.hash(),
+            Self::Eip7702(t) => t.hash(),
+            #[cfg(any(feature = "base", feature = "optimism"))]
+            Self::Deposit(t) => t.hash_ref(),
+            #[cfg(feature = "optimism")]
+            Self::PostExec(t) => t.hash_ref(),
+            #[cfg(feature = "base")]
+            Self::Eip8130(t) => t.hash(),
+            Self::Tempo(t) => t.hash(),
         }
     }
 }
 
-impl OpTransactionTrait for FoundryTxEnvelope {
-    fn is_deposit(&self) -> bool {
-        matches!(self, Self::Deposit(_))
+impl SignerRecoverable for FoundryTxEnvelope {
+    fn recover_signer(&self) -> Result<Address, RecoveryError> {
+        self.recover()
     }
 
-    fn as_deposit(&self) -> Option<&Sealed<TxDeposit>> {
-        match self {
-            Self::Deposit(tx) => Some(tx),
-            _ => None,
-        }
+    fn recover_signer_unchecked(&self) -> Result<Address, RecoveryError> {
+        self.recover()
     }
 }
 
@@ -123,13 +387,30 @@ impl TryFrom<FoundryTxEnvelope> for TxEnvelope {
     type Error = FoundryTxEnvelope;
 
     fn try_from(envelope: FoundryTxEnvelope) -> Result<Self, Self::Error> {
-        match envelope {
-            FoundryTxEnvelope::Legacy(tx) => Ok(Self::Legacy(tx)),
-            FoundryTxEnvelope::Eip2930(tx) => Ok(Self::Eip2930(tx)),
-            FoundryTxEnvelope::Eip1559(tx) => Ok(Self::Eip1559(tx)),
-            FoundryTxEnvelope::Eip4844(tx) => Ok(Self::Eip4844(tx)),
-            FoundryTxEnvelope::Eip7702(tx) => Ok(Self::Eip7702(tx)),
-            FoundryTxEnvelope::Deposit(_) => Err(envelope),
+        envelope.try_into_eth()
+    }
+}
+
+impl From<TxEnvelope> for FoundryTxEnvelope {
+    fn from(tx: TxEnvelope) -> Self {
+        match tx {
+            TxEnvelope::Legacy(tx) => Self::Legacy(tx),
+            TxEnvelope::Eip2930(tx) => Self::Eip2930(tx),
+            TxEnvelope::Eip1559(tx) => Self::Eip1559(tx),
+            TxEnvelope::Eip4844(tx) => Self::Eip4844(tx),
+            TxEnvelope::Eip7702(tx) => Self::Eip7702(tx),
+        }
+    }
+}
+
+impl From<tempo_primitives::TempoTxEnvelope> for FoundryTxEnvelope {
+    fn from(tx: tempo_primitives::TempoTxEnvelope) -> Self {
+        match tx {
+            tempo_primitives::TempoTxEnvelope::Legacy(tx) => Self::Legacy(tx),
+            tempo_primitives::TempoTxEnvelope::Eip2930(tx) => Self::Eip2930(tx),
+            tempo_primitives::TempoTxEnvelope::Eip1559(tx) => Self::Eip1559(tx),
+            tempo_primitives::TempoTxEnvelope::Eip7702(tx) => Self::Eip7702(tx),
+            tempo_primitives::TempoTxEnvelope::AA(tx) => Self::Tempo(tx),
         }
     }
 }
@@ -138,9 +419,21 @@ impl TryFrom<AnyRpcTransaction> for FoundryTxEnvelope {
     type Error = ConversionError;
 
     fn try_from(value: AnyRpcTransaction) -> Result<Self, Self::Error> {
-        let WithOtherFields { inner, .. } = value.0;
-        let from = inner.inner.signer();
-        match inner.inner.into_inner() {
+        #[cfg(feature = "base")]
+        if value.ty() == EIP8130_TRANSACTION_TYPE {
+            let rpc = serde_json::from_value::<Transaction>(
+                serde_json::to_value(&value)
+                    .map_err(|err| ConversionError::Custom(err.to_string()))?,
+            )
+            .map_err(|err| ConversionError::Custom(err.to_string()))?;
+            return match rpc.inner.into_inner() {
+                BaseTxEnvelope::Eip8130(tx) => Ok(Self::Eip8130(tx)),
+                _ => Err(ConversionError::Custom("expected Base EIP-8130 transaction".to_string())),
+            };
+        }
+        let transaction = value.into_inner();
+        let from = transaction.from();
+        match transaction.into_inner() {
             AnyTxEnvelope::Ethereum(tx) => match tx {
                 TxEnvelope::Legacy(tx) => Ok(Self::Legacy(tx)),
                 TxEnvelope::Eip2930(tx) => Ok(Self::Eip2930(tx)),
@@ -148,21 +441,101 @@ impl TryFrom<AnyRpcTransaction> for FoundryTxEnvelope {
                 TxEnvelope::Eip4844(tx) => Ok(Self::Eip4844(tx)),
                 TxEnvelope::Eip7702(tx) => Ok(Self::Eip7702(tx)),
             },
-            AnyTxEnvelope::Unknown(mut tx) => {
-                // Try to convert to deposit transaction
-                if tx.ty() == DEPOSIT_TX_TYPE_ID {
-                    tx.inner.fields.insert("from".to_string(), serde_json::to_value(from).unwrap());
-                    let deposit_tx =
-                        tx.inner.fields.deserialize_into::<TxDeposit>().map_err(|e| {
-                            ConversionError::Custom(format!(
-                                "Failed to deserialize deposit tx: {e}"
-                            ))
-                        })?;
+            AnyTxEnvelope::Unknown(tx) => {
+                if tx.ty() == CIP64_TX_TYPE {
+                    let mut fields = tx.inner.fields;
+                    fields.insert("hash".into(), serde_json::to_value(tx.hash).unwrap());
+                    return fields
+                        .deserialize_into::<Signed<TxCip64>>()
+                        .map(Self::Celo)
+                        .map_err(|err| ConversionError::Custom(err.to_string()));
+                }
+                if tx.ty() == TEMPO_TX_TYPE_ID {
+                    let tempo_tx = tx.inner.fields.deserialize_into::<AASigned>().map_err(|e| {
+                        ConversionError::Custom(format!("Failed to deserialize tempo tx: {e}"))
+                    })?;
+                    return Ok(Self::Tempo(tempo_tx));
+                }
 
-                    return Ok(Self::Deposit(Sealed::new(deposit_tx)));
-                };
+                #[cfg(all(feature = "base", not(feature = "optimism")))]
+                {
+                    let mut tx = tx;
+                    if tx.ty() == DEPOSIT_TX_TYPE_ID {
+                        tx.inner
+                            .fields
+                            .insert("from".to_string(), serde_json::to_value(from).unwrap());
+                        let deposit =
+                            tx.inner.fields.deserialize_into::<TxDeposit>().map_err(|err| {
+                                ConversionError::Custom(format!(
+                                    "Failed to deserialize deposit transaction: {err}"
+                                ))
+                            })?;
+                        return Ok(Self::Deposit(Sealed::new(deposit)));
+                    }
+                    let tx_type = tx.ty();
+                    Err(ConversionError::Custom(format!(
+                        "Unknown transaction type: 0x{tx_type:02X}"
+                    )))
+                }
+                #[cfg(feature = "optimism")]
+                {
+                    let mut tx = tx;
+                    let _ = from;
+                    // Try to convert to deposit transaction
+                    if tx.ty() == DEPOSIT_TX_TYPE_ID {
+                        tx.inner
+                            .fields
+                            .insert("from".to_string(), serde_json::to_value(from).unwrap());
+                        let deposit_tx =
+                            tx.inner.fields.deserialize_into::<TxDeposit>().map_err(|e| {
+                                ConversionError::Custom(format!(
+                                    "Failed to deserialize deposit tx: {e}"
+                                ))
+                            })?;
 
-                Err(ConversionError::Custom("UnknownTxType".to_string()))
+                        return Ok(Self::Deposit(Sealed::new(deposit_tx)));
+                    }
+
+                    if tx.ty() == POST_EXEC_TX_TYPE_ID {
+                        // The RPC form carries the RLP-encoded `PostExecPayload` in `input`;
+                        // `TxPostExec`'s own serde form expects the payload fields instead.
+                        let input = tx
+                            .inner
+                            .fields
+                            .get_deserialized::<Bytes>("input")
+                            .ok_or_else(|| {
+                                ConversionError::Custom(
+                                    "Post-exec tx is missing `input`".to_string(),
+                                )
+                            })?
+                            .map_err(|e| {
+                                ConversionError::Custom(format!(
+                                    "Failed to deserialize post-exec tx `input`: {e}"
+                                ))
+                            })?;
+                        let payload =
+                            PostExecPayload::from_rlp_bytes(input.as_ref()).map_err(|e| {
+                                ConversionError::Custom(format!(
+                                    "Failed to decode post-exec tx payload: {e}"
+                                ))
+                            })?;
+
+                        return Ok(Self::PostExec(Sealed::new(TxPostExec::new(payload))));
+                    }
+
+                    let tx_type = tx.ty();
+                    Err(ConversionError::Custom(format!(
+                        "Unknown transaction type: 0x{tx_type:02X}"
+                    )))
+                }
+                #[cfg(not(any(feature = "base", feature = "optimism")))]
+                {
+                    let _ = from;
+                    let tx_type = tx.ty();
+                    Err(ConversionError::Custom(format!(
+                        "Unknown transaction type: 0x{tx_type:02X}"
+                    )))
+                }
             }
         }
     }
@@ -174,32 +547,86 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TxEnv {
             FoundryTxEnvelope::Legacy(signed_tx) => Self::from_recovered_tx(signed_tx, caller),
             FoundryTxEnvelope::Eip2930(signed_tx) => Self::from_recovered_tx(signed_tx, caller),
             FoundryTxEnvelope::Eip1559(signed_tx) => Self::from_recovered_tx(signed_tx, caller),
-            FoundryTxEnvelope::Eip4844(signed_tx) => {
-                Self::from_recovered_tx(signed_tx.tx().tx(), caller)
+            // Anvil preserves the CIP-64 envelope but executes with native EIP-1559 fees.
+            FoundryTxEnvelope::Celo(signed_tx) => {
+                Self::from_recovered_tx(&signed_tx.tx().inner, caller)
             }
+            FoundryTxEnvelope::Eip4844(signed_tx) => Self::from_recovered_tx(signed_tx, caller),
             FoundryTxEnvelope::Eip7702(signed_tx) => Self::from_recovered_tx(signed_tx, caller),
+            #[cfg(any(feature = "base", feature = "optimism"))]
             FoundryTxEnvelope::Deposit(sealed_tx) => {
-                Self::from_recovered_tx(sealed_tx.inner(), caller)
+                let tx = sealed_tx.inner();
+                Self {
+                    tx_type: tx.ty(),
+                    caller,
+                    gas_limit: tx.gas_limit,
+                    kind: tx.to,
+                    value: tx.value,
+                    data: tx.input.clone(),
+                    ..Default::default()
+                }
             }
+            #[cfg(feature = "optimism")]
+            FoundryTxEnvelope::PostExec(sealed_tx) => {
+                let tx = sealed_tx.inner();
+                Self {
+                    tx_type: tx.ty(),
+                    caller,
+                    kind: tx.kind(),
+                    data: tx.input.clone(),
+                    ..Default::default()
+                }
+            }
+            #[cfg(feature = "base")]
+            FoundryTxEnvelope::Eip8130(_) => {
+                unreachable!("EIP-8130 transaction in Ethereum context")
+            }
+            FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Ethereum context"),
         }
     }
 }
 
-impl FromRecoveredTx<FoundryTxEnvelope> for OpTransaction<TxEnv> {
+impl FromTxWithEncoded<FoundryTxEnvelope> for TxEnv {
+    fn from_encoded_tx(tx: &FoundryTxEnvelope, sender: Address, _encoded: Bytes) -> Self {
+        Self::from_recovered_tx(tx, sender)
+    }
+}
+
+impl FromRecoveredTx<FoundryTxEnvelope> for TempoTxEnv {
     fn from_recovered_tx(tx: &FoundryTxEnvelope, caller: Address) -> Self {
-        let base = TxEnv::from_recovered_tx(tx, caller);
-
-        let deposit = if let FoundryTxEnvelope::Deposit(deposit_tx) = tx {
-            DepositTransactionParts {
-                source_hash: deposit_tx.source_hash,
-                mint: Some(deposit_tx.mint),
-                is_system_transaction: deposit_tx.is_system_transaction,
+        match tx {
+            FoundryTxEnvelope::Legacy(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
             }
-        } else {
-            Default::default()
-        };
+            FoundryTxEnvelope::Eip2930(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
+            }
+            FoundryTxEnvelope::Eip1559(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
+            }
+            FoundryTxEnvelope::Eip4844(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
+            }
+            FoundryTxEnvelope::Eip7702(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
+            }
+            #[cfg(any(feature = "base", feature = "optimism"))]
+            FoundryTxEnvelope::Deposit(_) => unreachable!("Deposit tx in Tempo context"),
+            #[cfg(feature = "optimism")]
+            FoundryTxEnvelope::PostExec(_) => unreachable!("Post-exec tx in Tempo context"),
+            #[cfg(feature = "base")]
+            FoundryTxEnvelope::Eip8130(_) => {
+                unreachable!("EIP-8130 transaction in Tempo context")
+            }
+            FoundryTxEnvelope::Tempo(aa_signed) => Self::from_recovered_tx(aa_signed, caller),
+            FoundryTxEnvelope::Celo(_) => unreachable!("CIP-64 transaction in Tempo context"),
+        }
+    }
+}
 
-        Self { base, deposit, enveloped_tx: None }
+impl FromTxWithEncoded<FoundryTxEnvelope> for TempoTxEnv {
+    fn from_encoded_tx(tx: &FoundryTxEnvelope, sender: Address, _encoded: Bytes) -> Self {
+        Self::from_recovered_tx(tx, sender)
     }
 }
 
@@ -211,7 +638,26 @@ impl std::fmt::Display for FoundryTxType {
             Self::Eip1559 => write!(f, "eip1559"),
             Self::Eip4844 => write!(f, "eip4844"),
             Self::Eip7702 => write!(f, "eip7702"),
+            #[cfg(any(feature = "base", feature = "optimism"))]
             Self::Deposit => write!(f, "deposit"),
+            #[cfg(feature = "optimism")]
+            Self::PostExec => write!(f, "post-exec"),
+            #[cfg(feature = "base")]
+            Self::Eip8130 => write!(f, "eip8130"),
+            Self::Tempo => write!(f, "tempo"),
+            Self::Celo => write!(f, "celo"),
+        }
+    }
+}
+
+impl From<TxType> for FoundryTxType {
+    fn from(tx: TxType) -> Self {
+        match tx {
+            TxType::Legacy => Self::Legacy,
+            TxType::Eip2930 => Self::Eip2930,
+            TxType::Eip1559 => Self::Eip1559,
+            TxType::Eip4844 => Self::Eip4844,
+            TxType::Eip7702 => Self::Eip7702,
         }
     }
 }
@@ -224,19 +670,177 @@ impl From<FoundryTxEnvelope> for FoundryTypedTx {
             FoundryTxEnvelope::Eip1559(signed_tx) => Self::Eip1559(signed_tx.strip_signature()),
             FoundryTxEnvelope::Eip4844(signed_tx) => Self::Eip4844(signed_tx.strip_signature()),
             FoundryTxEnvelope::Eip7702(signed_tx) => Self::Eip7702(signed_tx.strip_signature()),
-            FoundryTxEnvelope::Deposit(sealed_tx) => Self::Deposit(sealed_tx.into_inner()),
+            #[cfg(any(feature = "base", feature = "optimism"))]
+            FoundryTxEnvelope::Deposit(sealed_tx) => Self::Deposit(sealed_tx.unseal()),
+            #[cfg(feature = "optimism")]
+            FoundryTxEnvelope::PostExec(sealed_tx) => Self::PostExec(sealed_tx.unseal()),
+            #[cfg(feature = "base")]
+            FoundryTxEnvelope::Eip8130(signed_tx) => Self::Eip8130(signed_tx.into_tx()),
+            FoundryTxEnvelope::Tempo(signed_tx) => Self::Tempo(signed_tx.strip_signature()),
+            FoundryTxEnvelope::Celo(signed_tx) => Self::Celo(signed_tx.strip_signature()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use alloy_primitives::{TxKind, U256, address, b256, hex};
+    use alloy_rlp::Decodable;
     use std::str::FromStr;
 
-    use alloy_primitives::{Bytes, Signature, TxHash, TxKind, U256, b256, hex};
-    use alloy_rlp::Decodable;
+    fn signed<T>(tx: T) -> Signed<T> {
+        Signed::new_unchecked(tx, Signature::test_signature(), B256::ZERO)
+    }
 
-    use super::*;
+    /// A plain Ethereum transaction in its JSON-RPC form.
+    const ETH_RPC_TX: &str = r#"{"type":"0x0","chainId":"0x1","nonce":"0x15","gasPrice":"0x4a817c800","gas":"0xc350","to":"0xf02c1c8e6114b1dbe8937a39260b5b0a374432bb","value":"0xf3dbb76162000","input":"0x68656c6c6f21","r":"0x1b5e176d927f8e9ab405058b2d2457392da3e20f328b16ddabcebc33eaac5fea","s":"0x4ba69724e8f69de52f0125ad8b3c5c2cef33019bac3249e2c0a2192766d1721c","v":"0x25","hash":"0x88df016429689c079f3b2f6ad39fa052532c56795b733da78a91ebe6a713944b","blockHash":"0x1d59ff54b1eb26b013ce3cb5fc9dab3705b415a67127a003c3e61eb445bb8df2","blockNumber":"0x5daf3b","transactionIndex":"0x41","from":"0xa7d9ddbe1f17865597fbd27ec712455208b6b76d"}"#;
+
+    /// An OP-stack post-exec transaction (SDM, type `0x7D`) as returned by
+    /// `eth_getTransactionByHash`. The RLP-encoded `PostExecPayload` is carried in `input`; the
+    /// remaining fields are derived placeholders.
+    #[cfg(feature = "optimism")]
+    const OP_POST_EXEC_RPC_TX: &str = r#"{"blockHash":"0x72edd91c1b181b566e08846b9fe67e3d746c4e6555e6fb81f0d1acd9465f7322","blockNumber":"0x44ee2d","blockTimestamp":"0x6aadaad9","from":"0x0000000000000000000000000000000000000000","gas":"0x0","gasPrice":"0xfb","hash":"0x748fc6eb383fc0f2a92089556f639d4bdb1d363cb50e1be8acae2df338ba6963","input":"0xf83d018344ee2df7c4028207d0c4038207d0c4048207d0c4058207d0c4068207d0c4078207d0c4088207d0c4098207d0c40a8207d0c40b8207d0c40c8207d0","transactionIndex":"0xd","type":"0x7d","value":"0x0"}"#;
+
+    /// An `ArbitrumInternalTx`, a type alloy models only as [`AnyTxEnvelope::Unknown`].
+    const ARBITRUM_INTERNAL_RPC_TX: &str = r#"{"type":"0x6a","chainId":"0xa4b1","nonce":"0x0","gasPrice":"0x0","gas":"0x0","to":"0x00000000000000000000000000000000000a4b05","value":"0x0","input":"0x6bf6a42d","r":"0x0","s":"0x0","v":"0x0","hash":"0xe5ad4cc44e5cd67a464c038af87169fde2bd475f2c00306bd2d55ca2c5e4452e","blockHash":"0x0ce1511da42af573bac6870ef058d63bc4c8552440e97c149d4d539c482b5f7a","blockNumber":"0x1dc83ddc","transactionIndex":"0x0","from":"0x00000000000000000000000000000000000a4b05"}"#;
+
+    #[test]
+    fn encode_rpc_2718_matches_consensus_encoding() {
+        let tx: AnyRpcTransaction = serde_json::from_str(ETH_RPC_TX).unwrap();
+        let expected = hex!(
+            "f871158504a817c80082c35094f02c1c8e6114b1dbe8937a39260b5b0a374432bb870f3dbb761620008668656c6c6f2125a01b5e176d927f8e9ab405058b2d2457392da3e20f328b16ddabcebc33eaac5feaa04ba69724e8f69de52f0125ad8b3c5c2cef33019bac3249e2c0a2192766d1721c"
+        );
+
+        assert_eq!(FoundryTxEnvelope::encode_rpc_2718(&tx).unwrap(), expected[..]);
+    }
+
+    #[test]
+    fn encode_rpc_2718_rejects_unmodeled_type() {
+        let tx: AnyRpcTransaction = serde_json::from_str(ARBITRUM_INTERNAL_RPC_TX).unwrap();
+
+        // `AnyTxEnvelope::encode_2718` panics on this type, so it must not be reached.
+        assert!(FoundryTxEnvelope::encode_rpc_2718(&tx).is_err());
+    }
+
+    #[cfg(feature = "optimism")]
+    #[test]
+    fn encode_rpc_2718_post_exec_tx() {
+        let tx: AnyRpcTransaction = serde_json::from_str(OP_POST_EXEC_RPC_TX).unwrap();
+
+        let encoded = FoundryTxEnvelope::encode_rpc_2718(&tx).unwrap();
+
+        // The 2718 envelope is the `0x7d` type byte followed by the payload carried in `input`.
+        let expected = hex!(
+            "7df83d018344ee2df7c4028207d0c4038207d0c4048207d0c4058207d0c4068207d0c4078207d0c4088207d0c4098207d0c40a8207d0c40b8207d0c40c8207d0"
+        );
+        assert_eq!(encoded, expected[..]);
+    }
+
+    /// The RPC form carries the payload as RLP in `input`, not as a `PostExecPayload` object, and
+    /// the recomputed hash matches the one the node reported.
+    #[cfg(feature = "optimism")]
+    #[test]
+    fn post_exec_rpc_tx_decodes() {
+        let tx: AnyRpcTransaction = serde_json::from_str(OP_POST_EXEC_RPC_TX).unwrap();
+
+        let envelope = FoundryTxEnvelope::try_from(tx).unwrap();
+        let FoundryTxEnvelope::PostExec(sealed) = &envelope else {
+            panic!("expected a post-exec envelope, got {envelope:?}");
+        };
+
+        assert_eq!(
+            sealed.hash(),
+            b256!("0x748fc6eb383fc0f2a92089556f639d4bdb1d363cb50e1be8acae2df338ba6963")
+        );
+        // 11 rebated transactions, at indexes 2..=12, each refunded 2000 gas.
+        let payload = &sealed.inner().payload;
+        assert_eq!(payload.block_number, 0x44ee2d);
+        assert_eq!(payload.gas_refund_entries.len(), 11);
+    }
+
+    #[test]
+    fn tx_type_predicates() {
+        assert!(FoundryTxType::Legacy.is_legacy());
+        assert!(FoundryTxType::Eip2930.is_eip2930());
+        assert!(FoundryTxType::Eip1559.is_eip1559());
+        assert!(FoundryTxType::Eip4844.is_eip4844());
+        assert!(FoundryTxType::Eip7702.is_eip7702());
+        assert!(FoundryTxType::Tempo.is_tempo());
+        assert!(!FoundryTxType::Tempo.is_legacy());
+
+        #[cfg(any(feature = "base", feature = "optimism"))]
+        assert!(FoundryTxType::Deposit.is_deposit());
+        #[cfg(feature = "base")]
+        assert!(FoundryTxType::Eip8130.is_eip8130());
+        #[cfg(feature = "optimism")]
+        {
+            assert!(FoundryTxType::PostExec.is_post_exec());
+            assert!(!FoundryTxType::Deposit.is_post_exec());
+        }
+    }
+
+    #[test]
+    fn typed_tx_predicates() {
+        assert!(FoundryTypedTx::Legacy(TxLegacy::default()).is_legacy());
+        assert!(FoundryTypedTx::Eip2930(TxEip2930::default()).is_eip2930());
+        assert!(FoundryTypedTx::Eip1559(TxEip1559::default()).is_eip1559());
+        assert!(
+            FoundryTypedTx::Eip4844(TxEip4844Variant::TxEip4844(Default::default())).is_eip4844()
+        );
+        assert!(FoundryTypedTx::Eip7702(TxEip7702::default()).is_eip7702());
+        assert!(FoundryTypedTx::Tempo(TempoTransaction::default()).is_tempo());
+
+        #[cfg(any(feature = "base", feature = "optimism"))]
+        assert!(FoundryTypedTx::Deposit(TxDeposit::default()).is_deposit());
+        #[cfg(feature = "base")]
+        assert!(FoundryTypedTx::Eip8130(TxEip8130::default()).is_eip8130());
+        #[cfg(feature = "optimism")]
+        {
+            assert!(FoundryTypedTx::PostExec(TxPostExec::default()).is_post_exec());
+        }
+    }
+
+    #[test]
+    fn tx_envelope_predicates() {
+        assert!(FoundryTxEnvelope::Legacy(signed(TxLegacy::default())).is_legacy());
+        assert!(FoundryTxEnvelope::Eip2930(signed(TxEip2930::default())).is_eip2930());
+        assert!(FoundryTxEnvelope::Eip1559(signed(TxEip1559::default())).is_eip1559());
+        assert!(
+            FoundryTxEnvelope::Eip4844(signed(TxEip4844Variant::TxEip4844(Default::default())))
+                .is_eip4844()
+        );
+        assert!(FoundryTxEnvelope::Eip7702(signed(TxEip7702::default())).is_eip7702());
+
+        #[cfg(any(feature = "base", feature = "optimism"))]
+        assert!(FoundryTxEnvelope::Deposit(Sealed::new(TxDeposit::default())).is_deposit());
+        #[cfg(feature = "base")]
+        assert!(
+            FoundryTxEnvelope::Eip8130(Eip8130Signed::new(
+                TxEip8130::default(),
+                Default::default(),
+                Default::default()
+            ))
+            .is_eip8130()
+        );
+        #[cfg(feature = "optimism")]
+        {
+            assert!(FoundryTxEnvelope::PostExec(Sealed::new(TxPostExec::default())).is_post_exec());
+        }
+    }
+
+    #[test]
+    fn impersonated_tx_uses_nonzero_dummy_signature() {
+        let FoundryTxEnvelope::Legacy(tx) =
+            FoundryTypedTx::Legacy(TxLegacy::default()).into_impersonated()
+        else {
+            panic!("expected legacy transaction");
+        };
+
+        assert_eq!(tx.signature().r(), U256::ONE);
+        assert_eq!(tx.signature().s(), U256::ONE);
+        assert!(!tx.signature().v());
+    }
 
     #[test]
     fn test_decode_call() {
@@ -286,13 +890,11 @@ mod tests {
 
         assert_eq!(
             tx.hash(),
-            &"0x86718885c4b4218c6af87d3d0b0d83e3cc465df2a05c048aa4db9f1a6f9de91f"
-                .parse::<B256>()
-                .unwrap()
+            &b256!("0x86718885c4b4218c6af87d3d0b0d83e3cc465df2a05c048aa4db9f1a6f9de91f")
         );
         assert_eq!(
             tx.recover_signer().unwrap(),
-            "0x95222290DD7278Aa3Ddd389Cc1E1d165CC4BAfe5".parse::<Address>().unwrap()
+            address!("0x95222290DD7278Aa3Ddd389Cc1E1d165CC4BAfe5")
         );
     }
 
@@ -330,28 +932,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_encode_deposit_tx() {
-        // https://sepolia-optimism.etherscan.io/tx/0xbf8b5f08c43e4b860715cd64fc0849bbce0d0ea20a76b269e7bc8886d112fca7
-        let tx_hash: TxHash = "0xbf8b5f08c43e4b860715cd64fc0849bbce0d0ea20a76b269e7bc8886d112fca7"
-            .parse::<TxHash>()
-            .unwrap();
-
-        // https://sepolia-optimism.etherscan.io/getRawTx?tx=0xbf8b5f08c43e4b860715cd64fc0849bbce0d0ea20a76b269e7bc8886d112fca7
-        let raw_tx = alloy_primitives::hex::decode(
-            "7ef861a0dfd7ae78bf3c414cfaa77f13c0205c82eb9365e217b2daa3448c3156b69b27ac94778f2146f48179643473b82931c4cd7b8f153efd94778f2146f48179643473b82931c4cd7b8f153efd872386f26fc10000872386f26fc10000830186a08080",
-        )
-        .unwrap();
-        let dep_tx = FoundryTxEnvelope::decode(&mut raw_tx.as_slice()).unwrap();
-
-        let mut encoded = Vec::new();
-        dep_tx.encode_2718(&mut encoded);
-
-        assert_eq!(raw_tx, encoded);
-
-        assert_eq!(tx_hash, dep_tx.hash());
-    }
-
-    #[test]
     fn can_recover_sender_not_normalized() {
         let bytes = hex::decode("f85f800182520894095e7baea6a6c7c4c2dfeb977efac326af552d870a801ba048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804").unwrap();
 
@@ -364,17 +944,14 @@ mod tests {
         assert_eq!(tx.tx().gas_limit, 21000);
         assert_eq!(tx.tx().nonce, 0);
         if let TxKind::Call(to) = tx.tx().to {
-            assert_eq!(
-                to,
-                "0x095e7baea6a6c7c4c2dfeb977efac326af552d87".parse::<Address>().unwrap()
-            );
+            assert_eq!(to, address!("0x095e7baea6a6c7c4c2dfeb977efac326af552d87"));
         } else {
             panic!("expected a call transaction");
         }
         assert_eq!(tx.tx().value, U256::from(0x0au64));
         assert_eq!(
             tx.recover_signer().unwrap(),
-            "0f65fe9276bc9a24ae7083ae28e2660ef72df99e".parse::<Address>().unwrap()
+            address!("0f65fe9276bc9a24ae7083ae28e2660ef72df99e")
         );
     }
 
@@ -427,10 +1004,58 @@ mod tests {
         assert_eq!(tx_env.caller, sender);
         assert_eq!(tx_env.gas_limit, 0x5208);
         assert_eq!(tx_env.gas_price, 1);
+    }
 
-        // Test OpTransaction<TxEnv> conversion via FromRecoveredTx trait
-        let op_tx = OpTransaction::<TxEnv>::from_recovered_tx(&typed_tx, sender);
-        assert_eq!(op_tx.base.caller, sender);
-        assert_eq!(op_tx.base.gas_limit, 0x5208);
+    // Test vector from Tempo testnet:
+    // https://explorer.testnet.tempo.xyz/tx/0x6d6d8c102064e6dee44abad2024a8b1d37959230baab80e70efbf9b0c739c4fd
+    #[test]
+    fn test_decode_encode_tempo_tx() {
+        use alloy_primitives::address;
+        use tempo_primitives::TEMPO_TX_TYPE_ID;
+
+        let tx_hash: TxHash =
+            b256!("0x6d6d8c102064e6dee44abad2024a8b1d37959230baab80e70efbf9b0c739c4fd");
+
+        // Raw transaction from Tempo testnet via eth_getRawTransactionByHash
+        let raw_tx = hex::decode(
+            "76f9025e82a5bd808502cb4178008302d178f8fcf85c9420c000000000000000000000000000000000000080b844095ea7b3000000000000000000000000dec00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000989680f89c94dec000000000000000000000000000000000000080b884f8856c0f00000000000000000000000020c000000000000000000000000000000000000000000000000000000000000020c00000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000989680000000000000000000000000000000000000000000000000000000000097d330c0808080809420c000000000000000000000000000000000000180c0b90133027b98b7a8e6c68d7eac741a52e6fdae0560ce3c16ef5427ad46d7a54d0ed86dd41d000000007b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a2238453071464a7a50585167546e645473643649456659457776323173516e626966374c4741776e4b43626b222c226f726967696e223a2268747470733a2f2f74656d706f2d6465782e76657263656c2e617070222c2263726f73734f726967696e223a66616c73657dcfd45c3b19745a42f80b134dcb02a8ba099a0e4e7be1984da54734aa81d8f29f74bb9170ae6d25bd510c83fe35895ee5712efe13980a5edc8094c534e23af85eaacc80b21e45fb11f349424dce3a2f23547f60c0ff2f8bcaede2a247545ce8dd87abf0dbb7a5c9507efae2e43833356651b45ac576c2e61cec4e9c0f41fcbf6e",
+        )
+        .unwrap();
+
+        let tempo_tx = FoundryTxEnvelope::decode(&mut raw_tx.as_slice()).unwrap();
+
+        // Verify it's a Tempo transaction (type 0x76)
+        assert!(tempo_tx.is_type(TEMPO_TX_TYPE_ID));
+
+        let FoundryTxEnvelope::Tempo(ref aa_signed) = tempo_tx else {
+            panic!("Expected Tempo transaction");
+        };
+
+        // Verify the chain ID
+        assert_eq!(aa_signed.tx().chain_id, 42429);
+
+        // Verify the fee token
+        assert_eq!(
+            aa_signed.tx().fee_token,
+            Some(address!("0x20C0000000000000000000000000000000000001"))
+        );
+
+        // Verify gas limit
+        assert_eq!(aa_signed.tx().gas_limit, 184696);
+
+        // Verify we have 2 calls
+        assert_eq!(aa_signed.tx().calls.len(), 2);
+
+        // Verify the hash
+        assert_eq!(tx_hash, tempo_tx.hash());
+
+        // Verify round-trip encoding
+        let mut encoded = Vec::new();
+        tempo_tx.encode_2718(&mut encoded);
+        assert_eq!(raw_tx, encoded);
+
+        // Verify sender recovery (WebAuthn signature)
+        let sender = tempo_tx.recover().unwrap();
+        assert_eq!(sender, address!("0x566Ff0f4a6114F8072ecDC8A7A8A13d8d0C6B45F"));
     }
 }

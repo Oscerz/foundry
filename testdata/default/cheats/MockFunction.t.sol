@@ -3,7 +3,13 @@ pragma solidity ^0.8.18;
 
 import "utils/Test.sol";
 
-contract MockFunctionContract {
+interface IMockFunctionContract {
+    function a() external view returns (uint256);
+    function mocked_function() external;
+    function mocked_args_function(uint256 x) external;
+}
+
+contract MockFunctionContract is IMockFunctionContract {
     uint256 public a;
 
     function mocked_function() public {
@@ -15,7 +21,7 @@ contract MockFunctionContract {
     }
 }
 
-contract ModelMockFunctionContract {
+contract ModelMockFunctionContract is IMockFunctionContract {
     uint256 public a;
 
     function mocked_function() public {
@@ -27,13 +33,53 @@ contract ModelMockFunctionContract {
     }
 }
 
+contract Proxy {
+    address immutable impl;
+
+    constructor(address impl_) {
+        impl = impl_;
+    }
+
+    fallback() external {
+        _delegate(impl);
+    }
+
+    // code from https://github.com/OpenZeppelin/openzeppelin-contracts/blob/239795bea728c8dca4deb6c66856dd58a6991112/contracts/proxy/Proxy.sol#L22-L45
+    function _delegate(address implementation) internal virtual {
+        assembly {
+            // Copy msg.data. We take full control of memory in this inline assembly
+            // block because it will not return to Solidity code. We overwrite the
+            // Solidity scratch pad at memory position 0.
+            calldatacopy(0x00, 0x00, calldatasize())
+
+            // Call the implementation.
+            // out and outsize are 0 because we don't know the size yet.
+            let result := delegatecall(gas(), implementation, 0x00, calldatasize(), 0x00, 0x00)
+
+            // Copy the returned data.
+            returndatacopy(0x00, 0x00, returndatasize())
+
+            switch result
+            // delegatecall returns 0 on error.
+            case 0 {
+                revert(0x00, returndatasize())
+            }
+            default {
+                return(0x00, returndatasize())
+            }
+        }
+    }
+}
+
 contract MockFunctionTest is Test {
     MockFunctionContract my_contract;
     ModelMockFunctionContract model_contract;
+    IMockFunctionContract my_proxy;
 
     function setUp() public {
         my_contract = new MockFunctionContract();
         model_contract = new ModelMockFunctionContract();
+        my_proxy = IMockFunctionContract(address(new Proxy(address(my_contract))));
     }
 
     function test_mock_function() public {
@@ -69,4 +115,176 @@ contract MockFunctionTest is Test {
         my_contract.mocked_args_function(789);
         assertEq(my_contract.a(), 123 + 789);
     }
+
+    function test_mock_function_via_proxy() public {
+        vm.mockFunction(
+            address(my_proxy),
+            address(model_contract),
+            abi.encodeWithSelector(MockFunctionContract.mocked_function.selector)
+        );
+        my_proxy.mocked_function();
+        assertEq(my_proxy.a(), 123, "mocked function should be called via proxy");
+
+        // reset mock
+        vm.mockFunction(
+            address(my_proxy), address(my_proxy), abi.encodeWithSelector(MockFunctionContract.mocked_function.selector)
+        );
+        my_proxy.mocked_function();
+        assertEq(my_proxy.a(), 321, "after reset, original function should be called");
+    }
+
+    function test_mock_function_via_proxy_concrete_args() public {
+        vm.mockFunction(
+            address(my_proxy),
+            address(model_contract),
+            abi.encodeWithSelector(MockFunctionContract.mocked_args_function.selector, 100)
+        );
+        my_proxy.mocked_args_function(100);
+        assertEq(my_proxy.a(), 123 + 100, "mocked args function should be called via proxy");
+        my_proxy.mocked_args_function(200);
+        assertEq(my_proxy.a(), 321 + 200, "original args function should be called for different args");
+
+        // reset mock
+        vm.mockFunction(
+            address(my_proxy),
+            address(my_proxy),
+            abi.encodeWithSelector(MockFunctionContract.mocked_args_function.selector, 100)
+        );
+        my_proxy.mocked_args_function(100);
+        assertEq(my_proxy.a(), 321 + 100, "after reset, original args function should be called");
+        my_proxy.mocked_args_function(200);
+        assertEq(my_proxy.a(), 321 + 200, "original args function should be called for different args");
+    }
+
+    function test_mock_function_via_proxy_all_args() public {
+        vm.mockFunction(
+            address(my_proxy),
+            address(model_contract),
+            abi.encodeWithSelector(MockFunctionContract.mocked_args_function.selector)
+        );
+        my_proxy.mocked_args_function(300);
+        assertEq(my_proxy.a(), 123 + 300, "mocked args function should be called via proxy");
+        my_proxy.mocked_args_function(400);
+        assertEq(my_proxy.a(), 123 + 400, "mocked args function should be called via proxy");
+
+        // reset mock
+        vm.mockFunction(
+            address(my_proxy),
+            address(my_proxy),
+            abi.encodeWithSelector(MockFunctionContract.mocked_args_function.selector)
+        );
+        my_proxy.mocked_args_function(300);
+        assertEq(my_proxy.a(), 321 + 300, "after reset, original args function should be called");
+        my_proxy.mocked_args_function(400);
+        assertEq(my_proxy.a(), 321 + 400, "after reset, original args function should be called");
+    }
+
+    function test_mock_function_via_impl() public {
+        vm.mockFunction(
+            address(my_contract),
+            address(model_contract),
+            abi.encodeWithSelector(MockFunctionContract.mocked_function.selector)
+        );
+        my_proxy.mocked_function();
+        assertEq(my_proxy.a(), 123, "mocked function should be called via impl address");
+
+        // reset mock
+        vm.mockFunction(
+            address(my_contract),
+            address(my_contract),
+            abi.encodeWithSelector(MockFunctionContract.mocked_function.selector)
+        );
+        my_proxy.mocked_function();
+        assertEq(my_proxy.a(), 321, "after reset, original function should be called");
+    }
+
+    function test_mock_function_via_impl_concrete_args() public {
+        vm.mockFunction(
+            address(my_contract),
+            address(model_contract),
+            abi.encodeWithSelector(MockFunctionContract.mocked_args_function.selector, 200)
+        );
+        my_proxy.mocked_args_function(200);
+        assertEq(my_proxy.a(), 123 + 200, "mocked args function should be called via impl address");
+        my_proxy.mocked_args_function(300);
+        assertEq(my_proxy.a(), 321 + 300, "original args function should be called for different args");
+
+        // reset mock
+        vm.mockFunction(
+            address(my_contract),
+            address(my_contract),
+            abi.encodeWithSelector(MockFunctionContract.mocked_args_function.selector, 200)
+        );
+        my_proxy.mocked_args_function(200);
+        assertEq(my_proxy.a(), 321 + 200, "after reset, original args function should be called");
+        my_proxy.mocked_args_function(300);
+        assertEq(my_proxy.a(), 321 + 300, "original args function should be called for different args");
+    }
+
+    function test_mock_function_via_impl_all_args() public {
+        vm.mockFunction(
+            address(my_contract),
+            address(model_contract),
+            abi.encodeWithSelector(MockFunctionContract.mocked_args_function.selector)
+        );
+        my_proxy.mocked_args_function(400);
+        assertEq(my_proxy.a(), 123 + 400, "mocked args function should be called via impl address");
+        my_proxy.mocked_args_function(500);
+        assertEq(my_proxy.a(), 123 + 500, "mocked args function should be called via impl address");
+
+        // reset mock
+        vm.mockFunction(
+            address(my_contract),
+            address(my_contract),
+            abi.encodeWithSelector(MockFunctionContract.mocked_args_function.selector)
+        );
+        my_proxy.mocked_args_function(400);
+        assertEq(my_proxy.a(), 321 + 400, "after reset, original args function should be called");
+        my_proxy.mocked_args_function(500);
+        assertEq(my_proxy.a(), 321 + 500, "after reset, original args function should be called");
+    }
 }
+
+contract MockFunctionTarget {
+    uint256 public value;
+
+    function set() external {
+        value = 1;
+    }
+}
+
+contract MockFunctionReplacement {
+    uint256 public value;
+
+    function set() external {
+        value = 2;
+    }
+}
+
+abstract contract MockFunctionTransactionTests is Test {
+    address constant TARGET = address(0xAA);
+    address constant SIGNER = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
+
+    function setUp() public {
+        vm.etch(TARGET, address(new MockFunctionTarget()).code);
+    }
+
+    function test_mock_function_applies_to_executed_transaction() public {
+        vm.chainId(1);
+        vm.deal(SIGNER, 1 ether);
+        vm.mockFunction(TARGET, address(new MockFunctionReplacement()), abi.encodeCall(MockFunctionTarget.set, ()));
+
+        // Legacy signed transaction from `SIGNER` calling `set()` on `TARGET`:
+        // { nonce: 0, gas: 100000, gasPrice: 1, chainId: 1 }
+        vm.executeTransaction(
+            hex"f8648001830186a09400000000000000000000000000000000000000aa8084b8e010de25a0ef46df71876b9b91f78d5b6ed285dd38e95e8afb3350579225955dc6edb0c8cfa03eb5437a83b1300224803d69f2cd38d72679cd22b858f4cc3b95a322c32bc50b"
+        );
+
+        assertEq(MockFunctionTarget(TARGET).value(), 2);
+    }
+}
+
+contract MockFunctionTransactionTest is MockFunctionTransactionTests {}
+
+/// forge-config: default.isolate = false
+contract MockFunctionTransactionNonIsolatedTest is MockFunctionTransactionTests {}

@@ -14,6 +14,7 @@ extern crate tracing;
 #[macro_use]
 mod macros;
 
+pub mod etherscan;
 pub mod rpc;
 
 pub mod fd_lock;
@@ -21,9 +22,14 @@ pub mod fd_lock;
 mod filter;
 pub use filter::Filter;
 
+mod ext;
+pub use ext::ExtTester;
+
+mod prj;
+pub use prj::{TestCommand, TestProject, cargo_profile_dir};
+
 // Utilities for making it easier to handle tests.
 pub mod util;
-pub use util::{TestCommand, TestProject};
 
 mod script;
 pub use script::{ScriptOutcome, ScriptTester};
@@ -33,6 +39,7 @@ pub mod ui_runner;
 // re-exports for convenience
 pub use foundry_compilers;
 
+pub use foundry_test_macros::{casttest, forgetest, forgetest_init};
 pub use snapbox::{self, assert_data_eq, file, str};
 
 /// Initializes tracing for tests.

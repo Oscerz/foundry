@@ -46,7 +46,7 @@ pub fn block_on_handle<F: std::future::Future>(
 /// );
 /// ```
 pub fn erc7201(id: &str) -> B256 {
-    let x = U256::from_be_bytes(keccak256(id).0) - U256::from(1);
+    let x = Into::<U256>::into(keccak256(id)) - U256::ONE;
     keccak256(x.to_be_bytes::<32>()) & B256::from(!U256::from(0xff))
 }
 
@@ -74,6 +74,18 @@ pub fn ignore_metadata_hash(bytecode: &[u8]) -> &[u8] {
     }
 }
 
+/// Returns whether the CBOR metadata at the end of the bytecode contains a metadata hash
+/// (`ipfs`, `bzzr0` or `bzzr1`), which commits to the contract's sources and compiler settings.
+pub fn has_metadata_hash(bytecode: &[u8]) -> bool {
+    let Some(start) = find_metadata_start(bytecode) else { return false };
+    let Ok(ciborium::Value::Map(entries)) =
+        ciborium::from_reader::<ciborium::Value, _>(&bytecode[start..bytecode.len() - 2])
+    else {
+        return false;
+    };
+    entries.iter().any(|(key, _)| matches!(key.as_text(), Some("ipfs" | "bzzr0" | "bzzr1")))
+}
+
 /// Strips all __$xxx$__ placeholders from the bytecode if it's an unlinked bytecode.
 /// by replacing them with 20 zero bytes.
 /// This is useful for matching bytecodes to a contract source, and for the source map,
@@ -94,10 +106,12 @@ pub fn strip_bytecode_placeholders(bytecode: &BytecodeObject) -> Option<Bytes> {
 /// if the target cannot be compiled successfully. This would be the case if the target has invalid
 /// syntax. (e.g. Solang)
 pub fn flatten(project: Project, target_path: &Path) -> eyre::Result<String> {
-    let flattened = match Flattener::new(project.clone(), target_path) {
+    // Save paths for fallback before Flattener::new takes ownership
+    let paths = project.paths.clone();
+    let flattened = match Flattener::new(project, target_path) {
         Ok(flattener) => Ok(flattener.flatten()),
         Err(FlattenerError::Compilation(_)) => {
-            project.paths.with_language::<SolcLanguage>().flatten(target_path)
+            paths.with_language::<SolcLanguage>().flatten(target_path)
         }
         Err(FlattenerError::Other(err)) => Err(err),
     }
